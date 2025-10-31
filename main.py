@@ -1,6 +1,9 @@
 import yaml
 import time
 import re
+import threading
+from collections import defaultdict
+from datetime import datetime
 from wxauto import WeChat
 from wxauto.msgs import FriendMessage
 from message_supervisor import MessageSupervisor
@@ -26,6 +29,11 @@ class WeChatAutoResponder:
 
         # Store recent chat history for each user
         self.chat_histories = {}
+        
+        # Message queue and timers for batching responses
+        self.message_queues = defaultdict(list)
+        self.response_timers = {}
+        self.timer_locks = defaultdict(threading.Lock)
 
     def _load_config(self, config_file: str) -> dict:
         """Load configuration from YAML file"""
@@ -36,49 +44,73 @@ class WeChatAutoResponder:
             print(f"Error loading config: {e}")
             raise
 
-    def _build_chat_context(self, chat_name: str, current_message: str) -> list:
+    def _build_chat_context(self, chat_name: str, current_messages: list) -> list:
         """Build chat context for GPT from recent history"""
+        # Get user-specific prompt or use default
+        user_config = self.user_configs.get(chat_name, {})
+        user_prompt = user_config.get('prompt', '')
+        
+        # Build the system prompt with style instructions
+        system_prompt = f"""**STYLE INSTRUCTIONS**
+You are responding in a WeChat conversation. Follow these style guidelines:
+
+1. Mimic natural WeChat conversation style
+2. Keep responses concise and natural
+3. Match the tone from the conversation history
+4. DO NOT mention that you're an AI
+
+{f'**USER-SPECIFIC STYLE**{user_prompt}' if user_prompt else ''}"""
+            
         messages = [
             {
                 "role": "system",
-                "content": """You are mimicking the user's conversational style in WeChat.
-Analyze the chat history to understand:
-1. The user's tone (formal/casual, friendly/professional)
-2. Common phrases and expressions they use
-3. Length of typical responses
-4. Emoji usage patterns
-5. Language style (Chinese/English mix, slang, etc.)
-
-Respond naturally as if you ARE the user, matching their style exactly.
-Keep responses concise and natural for WeChat chat.
-DO NOT mention that you're an AI or mimicking anyone."""
+                "content": system_prompt
             }
         ]
 
-        # Add recent chat history
+        # Build conversation history section
+        history_text = ""
         if chat_name in self.chat_histories:
             history = self.chat_histories[chat_name][-self.history_length:]
+            history_lines = []
             for entry in history:
-                messages.append({
-                    "role": "assistant" if entry['is_user'] else "user",
-                    "content": entry['content']
-                })
+                sender = "Me" if entry['is_user'] else "Friend"
+                history_lines.append(f"{sender}: {entry['content']}")
+            if history_lines:
+                history_text = "\n**PREVIOUS CONVERSATION HISTORY**\n" + "\n".join(history_lines)
 
-        # Add current message
+        # Build current messages section
+        messages_to_respond = ""
+        if len(current_messages) == 1:
+            messages_to_respond = current_messages[0]
+        else:
+            messages_to_respond = "\n".join([f"[{i+1}] {msg}" for i, msg in enumerate(current_messages)])
+
+        # Combine everything into a clear user message
+        user_content = f"""**MESSAGES TO RESPOND TO**
+{messages_to_respond}
+{history_text}
+
+Please generate an appropriate response to the above message(s), considering the conversation history and following the style instructions."""
+
         messages.append({
-            "role": "user",
-            "content": current_message
+            "role": "user", 
+            "content": user_content
         })
 
+        # Log what we're sending to AI for debugging
+        print(f"\n[AI Request Structure]")
+        print(f"System Prompt: {system_prompt[:100]}...")
+        print(f"Messages to respond: {len(current_messages)} message(s)")
+        print(f"History context: {len(self.chat_histories.get(chat_name, []))} previous messages")
+        
         return messages
 
-    def get_gpt_reply(self, chat_name: str, message: str) -> str:
+    def get_gpt_reply(self, chat_name: str, batched_messages: list) -> str:
         """Get GPT-generated reply based on chat history and user's tone"""
         try:
-            print(f"[GPT] Generating response for: {message}")
-
             # Build context from chat history
-            messages = self._build_chat_context(chat_name, message)
+            messages = self._build_chat_context(chat_name, batched_messages)
 
             # Call OpenAI API
             response = self.openai_client.chat.completions.create(
@@ -89,15 +121,10 @@ DO NOT mention that you're an AI or mimicking anyone."""
             )
 
             reply = response.choices[0].message.content.strip()
-            print(f"[GPT] Generated reply: {reply}")
-
             return reply
 
         except Exception as e:
-            print(f"[ERROR] GPT generation failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return "收到"  # Fallback response
+            return "请稍等"  # Fallback response
 
     def _update_chat_history(self, chat_name: str, content: str, is_user: bool):
         """Update chat history for a user"""
@@ -140,14 +167,14 @@ DO NOT mention that you're an AI or mimicking anyone."""
                 chat_name = chat_str
 
         # Debug: Print message type
-        print(f"\n[DEBUG] Message received:")
-        print(f"  - Type: {msg.__class__.__name__}")
-        print(f"  - Chat object: '{chat}'")
-        print(f"  - Chat attributes: {dir(chat)}")
-        print(f"  - Chat name: '{chat_name}'")
-        print(f"  - msg.type: {msg.type}")
-        print(f"  - msg.attr: {msg.attr}")
-        print(f"  - Content: {msg.content}")
+        # print(f"\n[DEBUG] Message received:")
+        # print(f"  - Type: {msg.__class__.__name__}")
+        # print(f"  - Chat object: '{chat}'")
+        # print(f"  - Chat attributes: {dir(chat)}")
+        # print(f"  - Chat name: '{chat_name}'")
+        # print(f"  - msg.type: {msg.type}")
+        # print(f"  - msg.attr: {msg.attr}")
+        # print(f"  - Content: {msg.content}")
 
         # Log the received message
         self.supervisor.log_message(
@@ -162,59 +189,76 @@ DO NOT mention that you're an AI or mimicking anyone."""
         if msg.type in ('image', 'video'):
             try:
                 download_path = msg.download()
-                print(f"Downloaded {msg.type}: {download_path}")
             except Exception as e:
-                print(f"Error downloading {msg.type}: {e}")
-
-        # Debug: Check if it's a FriendMessage
-        print(f"[DEBUG] Is FriendMessage? {isinstance(msg, FriendMessage)}")
-        print(f"[DEBUG] Chat name in user_configs? {chat_name in self.user_configs}")
-        print(f"[DEBUG] User configs keys: {list(self.user_configs.keys())}")
+                pass
 
         # Update chat history with received message
         self._update_chat_history(chat_name, msg.content, is_user=False)
 
-        # Auto-reply to friend messages
+        # Auto-reply to friend messages with batching
         if isinstance(msg, FriendMessage):
-            print(f"[DEBUG] It's a FriendMessage!")
             # Check if this user has auto-reply configured
             if chat_name in self.user_configs:
-                print(f"[DEBUG] User is in config, sending auto-reply...")
-                try:
-                    # Get GPT-generated reply
-                    reply = self.get_gpt_reply(chat_name, msg.content)
-                    print(f"[DEBUG] GPT reply: {reply}")
+                # Add message to queue
+                with self.timer_locks[chat_name]:
+                    self.message_queues[chat_name].append((msg, msg.content))
+                    
+                    # Cancel existing timer if any
+                    if chat_name in self.response_timers:
+                        self.response_timers[chat_name].cancel()
+                    
+                    # Get wait time from config (default 5 seconds)
+                    wait_time = self.user_configs[chat_name].get('wait_time', 5)
+                    
+                    # Create new timer
+                    timer = threading.Timer(wait_time, self._send_batched_reply, args=[chat_name])
+                    self.response_timers[chat_name] = timer
+                    timer.start()
 
-                    # Random delay to seem natural
-                    import random
-                    delay = random.uniform(1, 3)
-                    print(f"[DEBUG] Waiting {delay:.2f} seconds...")
-                    time.sleep(delay)
-
-                    # Send reply using quote
-                    print(f"[DEBUG] Sending reply via msg.quote()...")
-                    msg.quote(reply)
-                    print(f"[DEBUG] Reply sent successfully!")
-
-                    # Update chat history with sent message
-                    self._update_chat_history(chat_name, reply, is_user=True)
-
-                    # Log the auto-reply
-                    self.supervisor.log_message(
-                        msg_type='text',
-                        msg_attr='self',
-                        chat=chat_name,
-                        content=reply,
-                        is_reply=True
-                    )
-
-                except Exception as e:
-                    print(f"[ERROR] Error sending auto-reply: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                print(f"[DEBUG] User '{chat_name}' not in config, skipping auto-reply")
-
+    def _send_batched_reply(self, chat_name: str):
+        """Send a batched reply after the timer expires"""
+        with self.timer_locks[chat_name]:
+            if not self.message_queues[chat_name]:
+                return
+            
+            # Get all queued messages
+            queued_messages = self.message_queues[chat_name].copy()
+            self.message_queues[chat_name].clear()
+            
+            # Remove timer reference
+            if chat_name in self.response_timers:
+                del self.response_timers[chat_name]
+        
+        try:
+            # Extract just the message contents
+            message_contents = [msg[1] for msg in queued_messages]
+            
+            # Get GPT reply for all messages
+            reply = self.get_gpt_reply(chat_name, message_contents)
+            
+            # Random delay to seem natural
+            import random
+            delay = random.uniform(1, 3)
+            time.sleep(delay)
+            
+            # Send reply using the last message's quote function
+            last_msg = queued_messages[-1][0]
+            last_msg.quote(reply)
+            
+            # Update chat history with sent message
+            self._update_chat_history(chat_name, reply, is_user=True)
+            
+            # Log the auto-reply
+            self.supervisor.log_message(
+                msg_type='text',
+                msg_attr='self',
+                chat=chat_name,
+                content=reply,
+                is_reply=True
+            )
+        except Exception as e:
+            pass
+    
     def save_initial_chat_history(self):
         """Save chat history for all configured users on startup and load into memory"""
         print("Saving initial chat history...")
@@ -271,8 +315,10 @@ DO NOT mention that you're an AI or mimicking anyone."""
         for user in users:
             nickname = user['nickname']
             enabled = user.get('enabled', True)
+            wait_time = user.get('wait_time', 5)
+            has_prompt = 'Yes' if user.get('prompt') else 'No'
             status = "Enabled" if enabled else "Disabled"
-            print(f"  - {nickname}: {status}")
+            print(f"  - {nickname}: {status} (Wait: {wait_time}s, Custom Prompt: {has_prompt})")
 
         print("-" * 60)
 
@@ -299,6 +345,11 @@ DO NOT mention that you're an AI or mimicking anyone."""
         except KeyboardInterrupt:
             print("\n" + "="*60)
             print("Stopping auto-responder...")
+            
+            # Cancel all pending timers
+            for chat_name in list(self.response_timers.keys()):
+                self.response_timers[chat_name].cancel()
+            self.response_timers.clear()
 
             # Remove all listeners
             for nickname in self.user_configs.keys():
